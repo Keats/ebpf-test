@@ -7,212 +7,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: r-lib/actions/setup-r@v2
+
       - name: Install eBPF tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y bpftrace bpfcc-tools linux-headers-$(uname -r)
-
-      - name: Verify eBPF capabilities
-        run: |
-          echo "Checking eBPF capabilities..."
-          sudo bpftrace --info
-          ls -la /sys/kernel/debug/tracing/ || echo "Debug tracing not accessible, but that's OK"
-
-      - name: Create test program
-        run: |
-          cat > test_file_ops.py << 'EOF'
-          #!/usr/bin/env python3
-          import os
-          import time
-          
-          def main():
-              print("Starting file operations test...")
-          
-              # Test file creation and writing
-              with open('/tmp/test1.txt', 'w') as f:
-                  f.write('Hello from Python test program!\n')
-                  f.write('This is a second line.\n')
-          
-              # Small delay to make tracing clearer
-              time.sleep(0.1)
-          
-              # Test file reading
-              with open('/tmp/test1.txt', 'r') as f:
-                  content = f.read()
-                  print(f"Read from test1.txt: {len(content)} bytes")
-          
-              time.sleep(0.1)
-          
-              # Test another file with multiple writes
-              with open('/tmp/test2.txt', 'w') as f:
-                  f.write('Second test file\n')
-                  f.write('Line 2\n')
-                  f.write('Line 3\n')
-          
-              # Test appending to existing file
-              with open('/tmp/test1.txt', 'a') as f:
-                  f.write('Appended line\n')
-          
-              # Test reading multiple files
-              for filename in ['/tmp/test1.txt', '/tmp/test2.txt']:
-                  try:
-                      with open(filename, 'r') as f:
-                          lines = f.readlines()
-                          print(f"File {filename} has {len(lines)} lines")
-                  except Exception as e:
-                      print(f"Error reading {filename}: {e}")
-          
-              print("File operations completed.")
-          
-          if __name__ == '__main__':
-              main()
-          EOF
-          chmod +x test_file_ops.py
+          sudo apt-get install -y bpftrace linux-headers-$(uname -r)
 
       - name: Trace file opens and writes
         run: |
-          # Create bpftrace script for file I/O tracing
-          cat > trace_file_io.bt << 'EOF'
-          BEGIN {
-              printf("%-8s %-20s %-8s %-10s %s\n", "TIME", "COMM", "PID", "ACTION", "DETAILS");
-          }
+          echo "=== Testing R process name ==="
           
-          tracepoint:syscalls:sys_enter_openat /comm == "python3" && (strcontains(str(args->filename), "/tmp/test"))/ {
-              printf("%-8s %-20s %-8d %-10s %s\n", 
-                     strftime("%H:%M:%S", nsecs), comm, pid, "OPEN", str(args->filename));
-          }
-          
-          tracepoint:syscalls:sys_enter_write /comm == "python3"/ {
-              printf("%-8s %-20s %-8d %-10s fd=%d, %d bytes\n", 
-                     strftime("%H:%M:%S", nsecs), comm, pid, "WRITE", args->fd, args->count);
-          }
-          
-          tracepoint:syscalls:sys_enter_read /comm == "python3"/ {
-              printf("%-8s %-20s %-8d %-10s fd=%d, %d bytes\n", 
-                     strftime("%H:%M:%S", nsecs), comm, pid, "READ", args->fd, args->count);
+          # Capture all processes during R execution
+          cat > debug_process.bt << 'EOF'
+          tracepoint:syscalls:sys_enter_openat /strcontains(str(args->filename), "hello.txt") || comm == "Rscript" || comm == "R"/ {
+              printf("PROCESS: %s opened: %s\n", comm, str(args->filename));
           }
           EOF
           
-          echo "Starting eBPF tracing..."
-          # Start tracing in background with timeout
-          sudo timeout 15 bpftrace trace_file_io.bt > trace_output.txt 2>&1 &
-          TRACE_PID=$!
+          sudo bpftrace debug_process.bt > debug_output.txt 2>&1 &
+          DEBUG_PID=$!
           
-          # Give tracer time to attach
-          sleep 2
-          
-          echo "Running Python test program..."
-          python3 test_file_ops.py
-          
-          # Let trace capture everything
+          sleep 1
+          echo "Running R script..."
+          Rscript test.R
           sleep 1
           
-          # Stop tracing gracefully or wait for timeout
-          sudo kill -INT $TRACE_PID 2>/dev/null || true
-          wait $TRACE_PID 2>/dev/null || true
+          sudo kill -KILL $DEBUG_PID 2>/dev/null || true
+          
+          echo "=== DEBUG RESULTS ==="
+          cat debug_output.txt
 
       - name: Show trace results
         run: |
-          echo "=== eBPF File I/O Trace Results ==="
-          cat trace_output.txt
+          echo "=== TRACE FILE SIZE ==="
+          ls -la all_r_operations.txt || echo "Trace file not found"
           
-          echo -e "\n=== Files created during test ==="
-          ls -la /tmp/test*.txt 2>/dev/null || echo "No test files found"
-          echo -e "\n=== Content of test files ==="
-          echo "--- test1.txt ---"
-          cat /tmp/test1.txt 2>/dev/null || echo "Could not read test1.txt"
-          echo "--- test2.txt ---"
-          cat /tmp/test2.txt 2>/dev/null || echo "Could not read test2.txt"
-
-      - name: Focused file tracing (test files only)
-        run: |
-          echo "=== Focused tracing - test files only ==="
-          # More targeted trace that only shows our test files
-          cat > focused_trace.bt << 'EOF'
-          tracepoint:syscalls:sys_enter_openat /strcontains(str(args->filename), "/tmp/test")/ {
-              printf("OPEN: %s (PID: %d, COMM: %s)\n", str(args->filename), pid, comm);
-          }
-          EOF
-          
-          sudo timeout 5 bpftrace focused_trace.bt > focused_output.txt &
-          sleep 1
-          
-          # Run a quick test
-          echo "Quick test data" > /tmp/test_focused.txt
-          cat /tmp/test_focused.txt > /dev/null
-          
-          sleep 1
-          echo "Focused trace results:"
-          cat focused_output.txt || echo "No focused output captured"
-
-      - name: Test simple file open tracing
-        run: |
-          echo "=== Simple file open tracing test ==="
-          # One-liner test to prove eBPF works
-          sudo timeout 5 bpftrace -e '
-            tracepoint:syscalls:sys_enter_openat /comm == "cat"/ { 
-              printf("cat opened: %s\n", str(args->filename)); 
-            }
-          ' > simple_trace.txt &
-          
-          sleep 1
-          cat /etc/hostname  # This should be traced
-          sleep 1
-          
-          echo "Simple trace results:"
-          cat simple_trace.txt || echo "No output captured"
-
-      - name: Advanced file operations analysis
-        run: |
-          # Create a more comprehensive analysis
-          cat > advanced_trace.bt << 'EOF'
-          BEGIN {
-              printf("Starting comprehensive file I/O analysis...\n");
-              @file_opens = 0;
-              @file_writes = 0;
-              @bytes_written = 0;
-          }
-          
-          tracepoint:syscalls:sys_enter_openat {
-              @file_opens++;
-              @files[str(args->filename)] = count();
-          }
-          
-          tracepoint:syscalls:sys_enter_write {
-              @file_writes++;
-              @bytes_written += args->count;
-          }
-          
-          interval:s:10 {
-              printf("\n=== FILE I/O SUMMARY ===\n");
-              printf("Total file opens: %d\n", @file_opens);
-              printf("Total writes: %d\n", @file_writes);
-              printf("Total bytes written: %d\n", @bytes_written);
-              printf("\nMost frequently accessed files:\n");
-              print(@files, 5);
-              printf("==========================\n");
-              exit();
-          }
-          EOF
-          
-          sudo bpftrace advanced_trace.bt &
-          ADVANCED_PID=$!
-          
-          # Generate some file activity
-          echo "test data" > /tmp/analysis_test1.txt
-          cat /etc/os-release > /dev/null
-          echo "more data" > /tmp/analysis_test2.txt
-          ls /tmp/ > /dev/null
-          
-          wait $ADVANCED_PID || true
-
-      - name: Upload trace artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ebpf-trace-results
-          path: |
-            trace_output.txt
-            focused_output.txt
-            simple_trace.txt
-            /tmp/test*.txt
-          if-no-files-found: warn
+          echo -e "\n=== TRACE CONTENTS ==="
+          cat all_r_operations.txt || echo "Could not read trace file"
